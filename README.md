@@ -3,10 +3,48 @@
 Wrapper script for OpenConnect supporting Azure AD (SAMLv2) authentication
 to Cisco SSL-VPNs
 
-[![Tests Status
-](https://github.com/vlaci/openconnect-sso/workflows/Tests/badge.svg?branch=master&event=push)](https://github.com/vlaci/openconnect-sso/actions?query=workflow%3ATests+branch%3Amaster+event%3Apush)
+> **Note:** This is a fork of
+> [vlaci/openconnect-sso](https://github.com/vlaci/openconnect-sso) hosted at
+> <https://github.com/jldowns/openconnect-sso>. It adds support for TLS client
+> certificate (CAC / PIV / smart-card) challenges in the embedded QtWebEngine
+> browser, which is needed for Azure AD Certificate-Based Authentication
+> (CBA). When the IdP requests a client certificate the embedded browser
+> automatically picks the smart-card authentication identity (preferring
+> certs that carry the Microsoft Smart Card Logon EKU) instead of giving up.
 
 ## Installation
+
+### Installing this fork
+
+This fork is not published to PyPI; install it directly from GitHub.
+Python **3.12** is recommended -- `lxml` 4.x (a transitive dependency)
+does not build on Python 3.13.
+
+With [`uv`](https://docs.astral.sh/uv/) (recommended):
+
+```shell
+uv tool install --python 3.12 \
+    "git+https://github.com/jldowns/openconnect-sso.git"
+```
+
+With `pipx`:
+
+```shell
+pipx install --python python3.12 \
+    "git+https://github.com/jldowns/openconnect-sso.git"
+```
+
+To upgrade later, re-run the same command with `--reinstall` (`uv`) or
+`--force` (`pipx`).
+
+You still need the system `openconnect` binary (and `sudo` on your `PATH`)
+at runtime; install it from your platform's package manager (e.g.
+`brew install openconnect` on macOS).
+
+### Upstream installation methods
+
+The methods below are the upstream project's instructions and will install
+the upstream package, **not this fork's CAC/PIV support**.
 
 ### Using pip/pipx
 

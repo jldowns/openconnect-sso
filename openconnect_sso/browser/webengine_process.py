@@ -208,12 +208,19 @@ autoFill();
         # CryptoTokenKit), which exposes CAC/PIV identities; on Linux it comes
         # from the NSS DB / PKCS#11 modules visible to Chromium.
         #
-        # Smart cards (CAC, PIV, commercial) typically expose multiple certs
-        # (e.g. authentication, signature, encryption, card-auth). Only the
-        # ones whose Extended Key Usage includes "TLS Web Client
-        # Authentication" (OID 1.3.6.1.5.5.7.3.2) are valid for mTLS, so
-        # filter on that. Falls back to all candidates if none advertise EKU
-        # (some certs omit it, in which case any usage is permitted).
+        # The Keychain / NSS DB usually hands us several candidates: the
+        # smart-card auth cert we want, plus assorted machine, MDM, and
+        # software user certs. We prefer them in this order:
+        #
+        #   1. Smart-card auth certs -- those carrying the Microsoft Smart
+        #      Card Logon EKU (1.3.6.1.4.1.311.20.2.2). NIST SP 800-78
+        #      mandates this EKU on every PIV/PIV-I authentication cert
+        #      (CAC, civilian PIV, commercial smart cards), and it's
+        #      essentially never on software certs, so it's the cleanest
+        #      vendor-neutral filter.
+        #   2. Anything that advertises the TLS Web Client Authentication
+        #      EKU (or no EKU at all, which RFC 5280 says permits any use).
+        #   3. The first candidate, as a last resort.
         certs = selection.certificates()
         logger.info("Client certificate requested", count=len(certs))
         if not certs:
@@ -222,9 +229,16 @@ autoFill();
         for c in certs:
             subj_cn = " ".join(c.subjectInfo(QSslCertificate.SubjectInfo.CommonName) or [])
             iss_cn = " ".join(c.issuerInfo(QSslCertificate.SubjectInfo.CommonName) or [])
-            logger.info("Candidate cert", subject=subj_cn, issuer=iss_cn)
-        eligible = [c for c in certs if _is_tls_client_cert(c)]
-        chosen = (eligible or certs)[0]
+            logger.info(
+                "Candidate cert",
+                subject=subj_cn,
+                issuer=iss_cn,
+                client_auth=_is_tls_client_cert(c),
+                smart_card=_is_smart_card_cert(c),
+            )
+        smart_cards = [c for c in certs if _is_smart_card_cert(c)]
+        client_auth = [c for c in certs if _is_tls_client_cert(c)]
+        chosen = (smart_cards or client_auth or certs)[0]
         subj_cn = " ".join(chosen.subjectInfo(QSslCertificate.SubjectInfo.CommonName) or [])
         iss_cn = " ".join(chosen.issuerInfo(QSslCertificate.SubjectInfo.CommonName) or [])
         logger.info("Selecting client cert", subject=subj_cn, issuer=iss_cn)
@@ -266,32 +280,78 @@ def to_str(qval):
     return bytes(qval).decode()
 
 
-# Extended Key Usage extension (RFC 5280 §4.2.1.12) and the TLS Web Client
-# Authentication purpose, identified by either its OID or Qt's friendly name.
+# Extended Key Usage extension (RFC 5280 §4.2.1.12) and the EKU values we
+# care about. We match by either Qt's parsed representation (OID string or
+# human-readable name) or by the OID's DER encoding, since Qt's certificate
+# parser on some platforms (notably macOS) leaves the EKU extension value
+# as raw DER bytes.
 _EKU_EXTENSION_OID = "2.5.29.37"
+
+# id-kp-clientAuth -- "TLS Web Client Authentication" (RFC 5280).
 _TLS_CLIENT_AUTH_OID = "1.3.6.1.5.5.7.3.2"
 _TLS_CLIENT_AUTH_NAME = "TLS Web Client Authentication"
+# DER: tag=OID(0x06), length=8, body=2B 06 01 05 05 07 03 02
+_TLS_CLIENT_AUTH_DER = b"\x06\x08\x2b\x06\x01\x05\x05\x07\x03\x02"
+
+# id-msSmartcardLogon -- Microsoft Smart Card Logon. Mandated by NIST
+# SP 800-78 for every PIV/PIV-I authentication certificate (CAC, civilian
+# PIV, commercial smart cards), and basically never present on software
+# machine/user certs. This is the strongest vendor-neutral hint that a
+# given candidate actually came from a smart card.
+_SC_LOGON_OID = "1.3.6.1.4.1.311.20.2.2"
+_SC_LOGON_NAME = "Microsoft Smartcard Login"
+# DER: tag=OID(0x06), length=10, body=2B 06 01 04 01 82 37 14 02 02
+_SC_LOGON_DER = b"\x06\x0a\x2b\x06\x01\x04\x01\x82\x37\x14\x02\x02"
 
 
-def _is_tls_client_cert(cert):
-    """Return True if `cert` advertises the clientAuth EKU, or has no EKU."""
+def _eku_values(cert):
+    """Return the set of EKU identifiers on `cert`, plus whether the EKU
+    extension is present at all. Identifiers are returned both as parsed
+    strings (when Qt decoded them) and as raw DER bytes (so callers can
+    do substring matches when Qt didn't)."""
     has_eku = False
+    parsed = set()
+    raw_blob = b""
     for ext in cert.extensions():
         if ext.oid() != _EKU_EXTENSION_OID:
             continue
         has_eku = True
         value = ext.value()
-        # Qt returns the EKU value as a list of usage identifiers; depending
-        # on the Qt build these can be either OID strings or human-readable
-        # names, so check for both.
-        usages = value if isinstance(value, (list, tuple)) else [value]
-        for usage in usages:
-            usage_str = str(usage)
-            if usage_str in (_TLS_CLIENT_AUTH_OID, _TLS_CLIENT_AUTH_NAME):
-                return True
-    # If the cert has no EKU extension at all, RFC 5280 says it's valid for
-    # any purpose -- treat it as eligible.
-    return not has_eku
+        if isinstance(value, (list, tuple)):
+            for usage in value:
+                parsed.add(str(usage))
+        else:
+            try:
+                raw_blob += bytes(value)
+            except TypeError:
+                pass
+    return has_eku, parsed, raw_blob
+
+
+def _has_eku(cert, oid, name, der):
+    has_eku, parsed, raw_blob = _eku_values(cert)
+    if not has_eku:
+        return False
+    if oid in parsed or name in parsed:
+        return True
+    return der in raw_blob
+
+
+def _is_tls_client_cert(cert):
+    """Return True if `cert` advertises the clientAuth EKU, or has no EKU
+    (RFC 5280: absent EKU extension means the cert is valid for any
+    purpose)."""
+    has_eku, _, _ = _eku_values(cert)
+    if not has_eku:
+        return True
+    return _has_eku(cert, _TLS_CLIENT_AUTH_OID, _TLS_CLIENT_AUTH_NAME, _TLS_CLIENT_AUTH_DER)
+
+
+def _is_smart_card_cert(cert):
+    """Return True if `cert` advertises the Microsoft Smart Card Logon EKU,
+    which PIV/PIV-I authentication certificates carry but ordinary machine
+    certificates do not."""
+    return _has_eku(cert, _SC_LOGON_OID, _SC_LOGON_NAME, _SC_LOGON_DER)
 
 
 def get_selectors(rules, credentials):
