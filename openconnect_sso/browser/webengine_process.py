@@ -10,7 +10,7 @@ import pkg_resources
 import structlog
 
 from PyQt6.QtCore import QUrl, QTimer, pyqtSlot, Qt
-from PyQt6.QtNetwork import QNetworkCookie, QNetworkProxy
+from PyQt6.QtNetwork import QNetworkCookie, QNetworkProxy, QSslCertificate
 from PyQt6.QtWebEngineCore import QWebEngineScript, QWebEngineProfile, QWebEnginePage
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import QApplication, QWidget, QSizePolicy, QVBoxLayout
@@ -151,6 +151,9 @@ class WebBrowser(QWebEngineView):
         cookie_store = self.page().profile().cookieStore()
         cookie_store.cookieAdded.connect(self._on_cookie_added)
         self.page().loadFinished.connect(self._on_load_finished)
+        # Handle TLS client-cert challenges (e.g. Azure CBA / DOD CAC). Without
+        # this signal hook QtWebEngine silently rejects every cert request.
+        self.page().selectClientCertificate.connect(self._on_select_client_cert)
 
     def createWindow(self, type):
         if type == QWebEnginePage.WebDialog:
@@ -197,6 +200,38 @@ autoFill();
         logger.debug("Page loaded", url=url)
 
         self._on_update(Url(url))
+
+    def _on_select_client_cert(self, selection):
+        # Picks a TLS client cert when the IdP (e.g. Azure CBA) requests one.
+        # On macOS the candidate list comes from the Keychain (via
+        # CryptoTokenKit), which exposes CAC/PIV identities; on Linux it comes
+        # from the NSS DB / PKCS#11 modules visible to Chromium.
+        #
+        # DOD CAC heuristic: of the 4 certs on the card, only the
+        # "PIV Authentication" one is valid for TLS client auth. It is issued
+        # by "DOD ID CA-*" and its subject CN is the user's name (contains
+        # '.', no '-'). The Card Authentication cert has the same issuer but
+        # a UUID-style CN; the Digital Signature / Encryption certs are
+        # issued by "DOD EMAIL CA-*". Falls back to the first candidate for
+        # non-CAC scenarios where there's typically only one cert anyway.
+        certs = selection.certificates()
+        logger.info("Client certificate requested", count=len(certs))
+        if not certs:
+            logger.warning("No client certificates available to QtWebEngine")
+            return
+        chosen = None
+        for c in certs:
+            subj_cn = " ".join(c.subjectInfo(QSslCertificate.SubjectInfo.CommonName) or [])
+            iss_cn = " ".join(c.issuerInfo(QSslCertificate.SubjectInfo.CommonName) or [])
+            logger.info("Candidate cert", subject=subj_cn, issuer=iss_cn)
+            if "ID CA" in iss_cn.upper() and "." in subj_cn and "-" not in subj_cn:
+                chosen = c
+                break
+        chosen = chosen or certs[0]
+        subj_cn = " ".join(chosen.subjectInfo(QSslCertificate.SubjectInfo.CommonName) or [])
+        iss_cn = " ".join(chosen.issuerInfo(QSslCertificate.SubjectInfo.CommonName) or [])
+        logger.info("Selecting client cert", subject=subj_cn, issuer=iss_cn)
+        selection.select(chosen)
 
 
 class WebPopupWindow(QWidget):
