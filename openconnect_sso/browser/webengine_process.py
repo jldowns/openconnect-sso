@@ -207,27 +207,23 @@ autoFill();
         # CryptoTokenKit), which exposes CAC/PIV identities; on Linux it comes
         # from the NSS DB / PKCS#11 modules visible to Chromium.
         #
-        # DOD CAC heuristic: of the 4 certs on the card, only the
-        # "PIV Authentication" one is valid for TLS client auth. It is issued
-        # by "DOD ID CA-*" and its subject CN is the user's name (contains
-        # '.', no '-'). The Card Authentication cert has the same issuer but
-        # a UUID-style CN; the Digital Signature / Encryption certs are
-        # issued by "DOD EMAIL CA-*". Falls back to the first candidate for
-        # non-CAC scenarios where there's typically only one cert anyway.
+        # Smart cards (CAC, PIV, commercial) typically expose multiple certs
+        # (e.g. authentication, signature, encryption, card-auth). Only the
+        # ones whose Extended Key Usage includes "TLS Web Client
+        # Authentication" (OID 1.3.6.1.5.5.7.3.2) are valid for mTLS, so
+        # filter on that. Falls back to all candidates if none advertise EKU
+        # (some certs omit it, in which case any usage is permitted).
         certs = selection.certificates()
         logger.info("Client certificate requested", count=len(certs))
         if not certs:
             logger.warning("No client certificates available to QtWebEngine")
             return
-        chosen = None
         for c in certs:
             subj_cn = " ".join(c.subjectInfo(QSslCertificate.SubjectInfo.CommonName) or [])
             iss_cn = " ".join(c.issuerInfo(QSslCertificate.SubjectInfo.CommonName) or [])
             logger.info("Candidate cert", subject=subj_cn, issuer=iss_cn)
-            if "ID CA" in iss_cn.upper() and "." in subj_cn and "-" not in subj_cn:
-                chosen = c
-                break
-        chosen = chosen or certs[0]
+        eligible = [c for c in certs if _is_tls_client_cert(c)]
+        chosen = (eligible or certs)[0]
         subj_cn = " ".join(chosen.subjectInfo(QSslCertificate.SubjectInfo.CommonName) or [])
         iss_cn = " ".join(chosen.issuerInfo(QSslCertificate.SubjectInfo.CommonName) or [])
         logger.info("Selecting client cert", subject=subj_cn, issuer=iss_cn)
@@ -267,6 +263,34 @@ class WebPopupWindow(QWidget):
 
 def to_str(qval):
     return bytes(qval).decode()
+
+
+# Extended Key Usage extension (RFC 5280 §4.2.1.12) and the TLS Web Client
+# Authentication purpose, identified by either its OID or Qt's friendly name.
+_EKU_EXTENSION_OID = "2.5.29.37"
+_TLS_CLIENT_AUTH_OID = "1.3.6.1.5.5.7.3.2"
+_TLS_CLIENT_AUTH_NAME = "TLS Web Client Authentication"
+
+
+def _is_tls_client_cert(cert):
+    """Return True if `cert` advertises the clientAuth EKU, or has no EKU."""
+    has_eku = False
+    for ext in cert.extensions():
+        if ext.oid() != _EKU_EXTENSION_OID:
+            continue
+        has_eku = True
+        value = ext.value()
+        # Qt returns the EKU value as a list of usage identifiers; depending
+        # on the Qt build these can be either OID strings or human-readable
+        # names, so check for both.
+        usages = value if isinstance(value, (list, tuple)) else [value]
+        for usage in usages:
+            usage_str = str(usage)
+            if usage_str in (_TLS_CLIENT_AUTH_OID, _TLS_CLIENT_AUTH_NAME):
+                return True
+    # If the cert has no EKU extension at all, RFC 5280 says it's valid for
+    # any purpose -- treat it as eligible.
+    return not has_eku
 
 
 def get_selectors(rules, credentials):
