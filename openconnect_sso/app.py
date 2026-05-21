@@ -1,5 +1,4 @@
 import asyncio
-import getpass
 import json
 import logging
 import os
@@ -16,7 +15,6 @@ from prompt_toolkit.shortcuts import radiolist_dialog
 from openconnect_sso import config
 from openconnect_sso.authenticator import Authenticator, AuthResponseError
 from openconnect_sso.browser import Terminated
-from openconnect_sso.config import Credentials
 from openconnect_sso.profile import get_profiles
 
 from requests.exceptions import HTTPError
@@ -109,20 +107,6 @@ def configure_logger(logger, level):
 
 async def _run(args, cfg):
     credentials = None
-    if cfg.credentials:
-        credentials = cfg.credentials
-    elif args.user:
-        credentials = Credentials(args.user)
-
-    if credentials and not credentials.password:
-        credentials.password = getpass.getpass(prompt=f"Password ({args.user}): ")
-        cfg.credentials = credentials
-
-    if credentials and not credentials.totp:
-        credentials.totp = getpass.getpass(
-            prompt=f"TOTP secret (leave blank if not required) ({args.user}): "
-        )
-        cfg.credentials = credentials
 
     if cfg.default_profile and not (args.use_profile_selector or args.server):
         selected_profile = cfg.default_profile

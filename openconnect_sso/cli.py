@@ -111,10 +111,6 @@ def create_argparser():
         nargs=argparse.REMAINDER,
     )
 
-    credentials_group = parser.add_argument_group("Credentials for automatic login")
-    credentials_group.add_argument(
-        "-u", "--user", help="Authenticate as the given user", default=None
-    )
     return parser
 
 
